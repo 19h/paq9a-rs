@@ -15,7 +15,7 @@ use crate::util::{MemLevel, Progress};
 use crate::encoder::{Encoder, BUFSIZE};
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write, Seek, BufReader, BufWriter};
+use std::io::{self, Read, Write, Seek, BufReader, BufWriter, SeekFrom, BufRead};
 use std::path::{Path, PathBuf};
 
 pub struct ArchiveOptions {
@@ -42,7 +42,7 @@ pub fn create_archive<P: AsRef<Path>>(archive: P, opts: ArchiveOptions, files: &
         bail!("Cannot overwrite archive {}", archive.as_ref().display());
     }
 
-    let mut out = BufWriter::new(File::create(&archive)?);
+    let mut out = BufWriter::with_capacity(1 << 20, File::create(&archive)?);
     // header
     out.write_all(HEADER_MAGIC)?;
     out.write_all(&[opts.mem.header_char()])?;
@@ -57,7 +57,7 @@ pub fn create_archive<P: AsRef<Path>>(archive: P, opts: ArchiveOptions, files: &
             continue;
         }
         let mut r = match File::open(&f) {
-            Ok(fh) => BufReader::new(fh),
+            Ok(fh) => BufReader::with_capacity(1 << 20, fh),
             Err(_) => {
                 eprintln!("File not found: {}", f.display());
                 continue;
@@ -95,7 +95,9 @@ fn store_file<R: Read, W: Write>(in_r: &mut R, out_w: &mut W) -> Result<()> {
         out_w.write_all(&[0u8, b's'])?;
         out_w.write_all(&(n as u32).to_be_bytes())?;
         out_w.write_all(&(n as u32).to_be_bytes())?;
-        out_w.write_all(&buf[..n])?;
+        if n != 0 {
+            out_w.write_all(&buf[..n])?;
+        }
         first = false;
     }
     Ok(())
@@ -110,24 +112,30 @@ fn compress_stream<R: Read, W: Write>(
 ) -> Result<()> {
 
     let mut enc: Encoder<'_, R, W> = Encoder::new_compress(progress.clone());
-    let mut buf1 = [0u8; 1];
 
-    while in_r.read(&mut buf1)? == 1 {
-        let c = buf1[0];
-        let cp = lzp.c();
-        if cp >= 0 && (c as i32) == cp {
-            enc.code(predictor, lzp, 1)?;
-        } else {
-            enc.code(predictor, lzp, 0)?;
-            for i in (0..8).rev() {
-                let b = (c >> i) & 1;
-                enc.code(predictor, lzp, b)?;
+    // Read source in large chunks to minimize syscall/branch overhead
+    const READBUF: usize = 1 << 20; // 1 MiB
+    let mut rbuf = vec![0u8; READBUF];
+
+    loop {
+        let n = in_r.read(&mut rbuf)?;
+        if n == 0 { break; }
+        for &c in &rbuf[..n] {
+            let cp = lzp.c();
+            if cp >= 0 && (c as i32) == cp {
+                enc.code(predictor, lzp, 1)?;
+            } else {
+                enc.code(predictor, lzp, 0)?;
+                for i in (0..8).rev() {
+                    let b = (c >> i) & 1;
+                    enc.code(predictor, lzp, b)?;
+                }
             }
-        }
-        enc.count_byte();
-        lzp.update(c);
-        if enc.pending_bytes() > BUFSIZE - 256 {
-            enc.flush(out_w)?;
+            enc.count_byte();
+            lzp.update(c);
+            if enc.pending_bytes() > BUFSIZE - 256 {
+                enc.flush(out_w)?;
+            }
         }
     }
     enc.flush(out_w)?;
@@ -135,7 +143,7 @@ fn compress_stream<R: Read, W: Write>(
 }
 
 pub fn list_archive<P: AsRef<Path>>(archive: P, mut out: impl Write) -> Result<()> {
-    let mut f = BufReader::new(File::open(&archive)
+    let mut f = BufReader::with_capacity(1 << 20, File::open(&archive)
         .with_context(|| format!("Cannot find archive {}", archive.as_ref().display()))?);
     // check header
     let mut header = [0u8; 4];
@@ -152,7 +160,7 @@ pub fn list_archive<P: AsRef<Path>>(archive: P, mut out: impl Write) -> Result<(
     let mut usum_file: f64 = 0.0;
     let mut csum_file: f64 = 0.0;
     let mut utotal: f64 = 0.0;
-    let mut ctotal: f64 = 4.0; // header bytes
+    let mut ctotal: f64 = 5.0; // header bytes (magic 4 + mem 1)
 
     loop {
         // Read filename (NUL-terminated) or EOF
@@ -163,11 +171,8 @@ pub fn list_archive<P: AsRef<Path>>(archive: P, mut out: impl Write) -> Result<(
             Ok(_) => {
                 if b[0] != 0 {
                     name_bytes.push(b[0]);
-                    loop {
-                        f.read_exact(&mut b)?;
-                        if b[0] == 0 { break; }
-                        name_bytes.push(b[0]);
-                    }
+                    f.read_until(0, &mut name_bytes)?; // includes 0
+                    if let Some(&0) = name_bytes.last() { name_bytes.pop(); }
                 } else {
                     // continuation block (no new file name)
                 }
@@ -196,7 +201,7 @@ pub fn list_archive<P: AsRef<Path>>(archive: P, mut out: impl Write) -> Result<(
             if m[0] != 0 {
                 bail!(
                     "Archive corrupted: expected block marker 0 after filename at {}",
-                    f.stream_position()? - 1
+                    f.get_ref().stream_position()? - 1
                 );
             }
             f.read_exact(&mut m)?; // now read the actual mode byte
@@ -208,18 +213,12 @@ pub fn list_archive<P: AsRef<Path>>(archive: P, mut out: impl Write) -> Result<(
         usum_file += usize as f64;
         csum_file += csize as f64 + 10.0;
 
-        if usize > 0xFFFF_FFFF || csize > 0xFFFF_FFFF || (mode != b'c' && mode != b's') {
-            bail!("Archive corrupted: usize={} csize={} mode={} at {}", usize, csize, mode, f.stream_position()?);
+        if mode != b'c' && mode != b's' {
+            bail!("Archive corrupted: usize={} csize={} mode={} at {}", usize, csize, mode, f.get_ref().stream_position()?);
         }
 
-        // skip payload
-        let mut remaining = csize;
-        let mut buf = [0u8; 4096];
-        while remaining > 0 {
-            let take = remaining.min(buf.len());
-            f.read_exact(&mut buf[..take])?;
-            remaining -= take;
-        }
+        // skip payload efficiently
+        f.seek(SeekFrom::Current(csize as i64))?;
     }
 
     if let Some(last) = cur_name.take() {
@@ -232,7 +231,7 @@ pub fn list_archive<P: AsRef<Path>>(archive: P, mut out: impl Write) -> Result<(
 }
 
 pub fn extract_archive<P: AsRef<Path>>(archive: P, outnames: &[PathBuf]) -> Result<()> {
-    let mut f = BufReader::new(File::open(&archive)
+    let mut f = BufReader::with_capacity(1 << 20, File::open(&archive)
         .with_context(|| format!("Cannot find archive {}", archive.as_ref().display()))?);
     // header
     let mut header = [0u8; 4];
@@ -261,11 +260,8 @@ pub fn extract_archive<P: AsRef<Path>>(archive: P, outnames: &[PathBuf]) -> Resu
             Ok(_) => {
                 if b[0] != 0 {
                     filename.push(b[0]);
-                    loop {
-                        f.read_exact(&mut b)?;
-                        if b[0] == 0 { break; }
-                        filename.push(b[0]);
-                    }
+                    f.read_until(0, &mut filename)?;
+                    if let Some(&0) = filename.last() { filename.pop(); }
                 } else {
                     // zero already - new block continues current file
                 }
@@ -291,7 +287,7 @@ pub fn extract_archive<P: AsRef<Path>>(archive: P, outnames: &[PathBuf]) -> Resu
             } else {
                 match OpenOptions::new().write(true).create_new(true).open(&outname) {
                     Ok(fh) => {
-                        current_out = Some(BufWriter::new(fh));
+                        current_out = Some(BufWriter::with_capacity(1 << 20, fh));
                         eprint!("\n{} ", outname.display());
                     }
                     Err(_) => eprint!("\nCannot create file: {} ", outname.display()),
@@ -307,7 +303,7 @@ pub fn extract_archive<P: AsRef<Path>>(archive: P, outnames: &[PathBuf]) -> Resu
             if m[0] != 0 {
                 bail!(
                     "Archive corrupted: expected block marker 0 after filename at {}",
-                    f.stream_position()? - 1
+                    f.get_ref().stream_position()? - 1
                 );
             }
             // Read the actual mode byte now.
@@ -412,11 +408,10 @@ pub fn extract_archive<P: AsRef<Path>>(archive: P, outnames: &[PathBuf]) -> Resu
 
                 // consume any leftover compressed bytes (should be zero)
                 if in_remaining > 0 {
-                    let mut sinkbuf = vec![0u8; in_remaining];
-                    f.read_exact(&mut sinkbuf)?;
+                    f.seek(SeekFrom::Current(in_remaining as i64))?;
                 }
             }
-            _ => bail!("Unsupported block mode {} at {}", mode, f.stream_position()?),
+            _ => bail!("Unsupported block mode {} at {}", mode, f.get_ref().stream_position()?),
         }
     }
 
@@ -427,6 +422,7 @@ pub fn extract_archive<P: AsRef<Path>>(archive: P, outnames: &[PathBuf]) -> Resu
     Ok(())
 }
 
+#[inline(always)]
 fn read_u32_be<R: Read>(r: &mut R) -> Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
@@ -437,14 +433,12 @@ fn unstore<R: Read>(r: &mut R, out: &mut dyn Write, usize: usize, csize: usize) 
     if usize != csize {
         bail!("Bad archive format: usize={} csize={}", usize, csize);
     }
-    const BUFSIZE: usize = 0x1000;
-    let mut remaining = csize;
-    let mut buf = [0u8; BUFSIZE];
-    while remaining > 0 {
-        let take = remaining.min(BUFSIZE);
-        r.read_exact(&mut buf[..take])?;
-        out.write_all(&buf[..take])?;
-        remaining -= take;
+    let remaining = csize as u64;
+    // Limit reader to exactly csize bytes and copy to writer
+    let mut limited = r.take(remaining);
+    let copied = io::copy(&mut limited, out)?;
+    if copied != remaining {
+        bail!("Short read in store block: expected {} got {}", remaining, copied);
     }
     Ok(())
 }

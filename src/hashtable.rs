@@ -3,15 +3,20 @@
 //!
 //! Layout per bucket (B >= 2):
 //!   [0] = checksum (u8)
-//!   [1] = priority (u8, 0 means empty, larger is more recently used)
+//!   [1] = priority (u8, 0 means empty, larger is more recently/frequently used)
 //!   [2..B-1] = payload data
 //!
 //! Probing: 3 locations in a cache-line range: i, i^B, i^(2B)
 //! Replacement: choose the one with smallest priority.
+//!
+//! Implementation notes:
+//! - Uses a single contiguous byte slab to preserve spatial locality.
+//! - B and nbytes must be powers of two; buckets are B-byte aligned within the slab.
+//! - Optional CPU prefetch (feature "prefetch") to hide DRAM latency on the 3 probes.
 
 pub struct HashTable<const B: usize> {
-    t: Vec<u8>,
-    nbytes: usize,
+    pub(crate) t: Vec<u8>,
+    pub(crate) nbytes: usize,
 }
 
 impl<const B: usize> HashTable<B> {
@@ -22,51 +27,74 @@ impl<const B: usize> HashTable<B> {
         Self { t, nbytes }
     }
 
-    #[inline(always)]
-    fn bucket(&mut self, i: usize) -> &mut [u8] {
-        &mut self.t[i..i + B]
-    }
-
     /// Lookup bucket for logical index `idx` and return the starting index
-    /// (byte offset) into `t`.
+    /// (byte offset) into `t`. Priority is bumped on use (saturating).
+    #[inline(always)]
     pub fn lookup(&mut self, idx: u32) -> usize {
+        // Mix idx -> pseudo-random byte address within table
         let mut i = idx.wrapping_mul(123_456_791);
         i = i.rotate_left(16);
         i = i.wrapping_mul(234_567_891);
+
         let chk = (i >> 24) as u8;
-        let mut offs = ((i as usize) * B) & (self.nbytes - B);
+        let mask_base = self.nbytes - B;
+        // `offs*` always aligned to bucket size since we multiply by B
+        let offs0 = ((i as usize) * B) & mask_base;
+        let offs1 = offs0 ^ B;
+        let offs2 = offs0 ^ (B * 2);
 
-        // probe 3 adjacent locations
-        if self.t[offs] == chk {
-            return offs;
+        #[cfg(all(feature="prefetch", any(target_arch="x86", target_arch="x86_64")))]
+        unsafe {
+            use core::arch::x86_64::_mm_prefetch;
+            const _MM_HINT_T0: i32 = 3;
+            _mm_prefetch(self.t.as_ptr().add(offs0) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.t.as_ptr().add(offs1) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.t.as_ptr().add(offs2) as *const i8, _MM_HINT_T0);
         }
-        let offs1 = offs ^ B;
-        if self.t[offs1] == chk {
-            return offs1;
-        }
-        let offs2 = offs ^ (B * 2);
-        if self.t[offs2] == chk {
-            return offs2;
-        }
 
-        // replacement policy: lowest priority (byte 1)
-        let p0 = self.t[offs + 1];
-        let p1 = self.t[offs1 + 1];
-        let p2 = self.t[offs2 + 1];
+        // Probe 3 adjacent buckets for checksum match.
+        // Choose hit if any; otherwise pick the lowest-priority victim to replace.
+        let t = &mut self.t;
+        let hit_offs = if unsafe { *t.get_unchecked(offs0) } == chk {
+            Some(offs0)
+        } else if unsafe { *t.get_unchecked(offs1) } == chk {
+            Some(offs1)
+        } else if unsafe { *t.get_unchecked(offs2) } == chk {
+            Some(offs2)
+        } else {
+            None
+        };
 
-        offs = if p0 > p1 || p0 > p2 { offs ^ B } else { offs };
-        let po = self.t[offs + 1];
-        offs = if po > self.t[(offs ^ (B * 2)) + 1] { offs ^ (B * 2) } else { offs };
+        let chosen = if let Some(o) = hit_offs {
+            o
+        } else {
+            // replacement policy: lowest priority (byte 1)
+            let p0 = unsafe { *t.get_unchecked(offs0 + 1) };
+            let p1 = unsafe { *t.get_unchecked(offs1 + 1) };
+            let p2 = unsafe { *t.get_unchecked(offs2 + 1) };
 
-        // replace
-        {
-            let b = self.bucket(offs);
-            for x in b.iter_mut() {
-                *x = 0;
+            // choose among offs0, offs1, offs2 the smallest priority
+            let (mut offs, mut pr) = (offs0, p0);
+            if p1 < pr { offs = offs1; pr = p1; }
+            if p2 < pr { offs = offs2; /* pr = p2; */ }
+
+            // replace
+            {
+                let b = &mut t[offs..offs + B];
+                for x in b.iter_mut() {
+                    *x = 0;
+                }
+                b[0] = chk;
+                // b[1] remains 0; we'll bump below to 1
             }
-            b[0] = chk;
-        }
-        offs
+            offs
+        };
+
+        // bump priority (saturating) to reward use
+        let pr = &mut t[chosen + 1];
+        *pr = pr.saturating_add(1);
+
+        chosen
     }
 
     #[inline(always)]

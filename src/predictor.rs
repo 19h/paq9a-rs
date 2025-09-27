@@ -79,8 +79,8 @@ impl Predictor {
                 match sc.tref {
                     TableRef::T2 { base } => {
                         let idx = base + sc.offset as usize;
-                        let st = self.t2[idx];
-                        self.t2[idx] = nex(st, y);
+                        let st = unsafe { *self.t2.get_unchecked(idx) };
+                        unsafe { *self.t2.get_unchecked_mut(idx) = nex(st, y) };
                         self.sm[i].update(y, 255);
                         if i > 0 {
                             self.m[i - 1].update(y);
@@ -116,6 +116,7 @@ impl Predictor {
     }
 
     /// Probability for next bit (0..4095)
+    #[inline(always)]
     pub fn p(&mut self, lzp: &mut LZP) -> i32 {
         if self.c0 == 0 {
             return lzp.p();
@@ -124,7 +125,6 @@ impl Predictor {
         // pc = LZP predicted byte; r tests if current known bits equal pc's high bits
         let mut pc = lzp.c(); // -1 or 0..255
         let r = if pc >= 0 {
-            // Assumption A1: r = (((pc + 256) >> (8 - bcount)) == c0) ? 1 : 0
             let rcalc = (((pc as i32 + 256) >> (8 - self.bcount) as i32) & 0xFF) as u8 == self.c0;
             if rcalc { 1 } else { 0 }
         } else {
@@ -191,7 +191,7 @@ impl Predictor {
         // Compute prediction by mixing contexts
         self.last_cells[0].offset = self.c0;
         let st0 = match self.last_cells[0].tref {
-            TableRef::T2 { base } => self.t2[base + self.c0 as usize],
+            TableRef::T2 { base } => unsafe { *self.t2.get_unchecked(base + self.c0 as usize) },
             _ => unreachable!(),
         };
         let mut pr = stretch(self.sm[0].p(st0 as usize));
@@ -199,7 +199,7 @@ impl Predictor {
             let off = if i < 4 { self.c0 } else { self.nibble };
             self.last_cells[i].offset = off;
             let st = match self.last_cells[i].tref {
-                TableRef::T2 { base } => self.t2[base + off as usize],
+                TableRef::T2 { base } => unsafe { *self.t2.get_unchecked(base + off as usize) },
                 TableRef::T { base } => *self.t.get_byte_mut(base, off as usize),
             };
             let pr2 = stretch(self.sm[i].p(st as usize));

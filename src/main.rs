@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
             extract_archive(archive, outnames)?;
         }
         Commands::L { archive } => {
-            let mut out = std::io::BufWriter::new(std::io::stdout());
+            let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout());
             list_archive(archive, &mut out)?;
         }
     }

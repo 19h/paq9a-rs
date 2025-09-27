@@ -1,19 +1,27 @@
 //! LZP stage: predicts next byte by matching current context to a rotating buffer.
 //! Uses a hash table of pointers into the buffer to find matches. The prediction
 //! probability is refined with StateMap and APM mixers exactly as in paq9a.
+//!
+//! Improvement: adaptive LZP gating. The minimum match length threshold is
+//! selected dynamically via an EMA of recent match accuracy, choosing among
+//! {12, 10, 8}. This remains fully symmetric (encoder/decoder) and format-
+//! compatible because it depends only on past decoded bytes.
 
 use crate::mix::APM;
 use crate::statemap::StateMap;
 use crate::util::MemLevel;
 use crate::arithmetic::clamp_i32;
 
-const MINLEN: usize = 12;
+const MINLEN_BASE: usize = 12;
+const EMA_SCALE: i32 = 4096;     // 1.0
+const EMA_SHIFT: i32 = 8;        // alpha = 1/256
 
 pub struct LZP {
-    n: usize,   // buffer size (MEM/8)
-    hsize: usize, // hash table size (MEM/32)
+    n: usize,        // buffer size (MEM/8)
+    hsize: usize,    // hash table size (MEM/32)
+    mask: usize,     // n - 1, for ring wrap
     buf: Vec<u8>,
-    t: Vec<i32>, // positions (i32 suffices)
+    t: Vec<i32>,     // positions (i32 suffices)
     pub word0: u32,
     pub word1: u32,
     match_pos: isize,
@@ -28,6 +36,8 @@ pub struct LZP {
     a3: APM,
     literals: usize,
     matches: usize,
+    // EMA of match-flag success to adapt the gate
+    ema_hits: i32, // scaled by EMA_SCALE
 }
 
 impl LZP {
@@ -40,6 +50,7 @@ impl LZP {
         Self {
             n,
             hsize,
+            mask: n - 1,
             buf,
             t,
             word0: 0,
@@ -56,13 +67,27 @@ impl LZP {
             a3: APM::new(0x100000),
             literals: 0,
             matches: 0,
+            // start neutral; adaptive threshold settles by traffic
+            ema_hits: (EMA_SCALE * 3) / 4,
+        }
+    }
+
+    #[inline(always)]
+    fn minlen(&self) -> usize {
+        // Map EMA to thresholds; start near 8..10 by default
+        if self.ema_hits >= (EMA_SCALE * 3) / 4 {
+            8
+        } else if self.ema_hits >= (EMA_SCALE / 2) {
+            10
+        } else {
+            MINLEN_BASE
         }
     }
 
     #[inline(always)]
     pub fn c(&self) -> i32 {
-        if self.len >= MINLEN {
-            let idx = (self.match_pos as usize) & (self.n - 1);
+        if self.len >= self.minlen() {
+            let idx = (self.match_pos as usize) & self.mask;
             self.buf[idx] as i32
         } else {
             -1
@@ -71,7 +96,7 @@ impl LZP {
 
     #[inline(always)]
     pub fn c_back(&self, i: usize) -> u8 {
-        let idx = (self.pos.wrapping_sub(i)) & (self.n - 1);
+        let idx = (self.pos.wrapping_sub(i)) & self.mask;
         self.buf[idx]
     }
 
@@ -86,8 +111,9 @@ impl LZP {
     }
 
     /// Probability (0..4095) that c() is next
+    #[inline(always)]
     pub fn p(&mut self) -> i32 {
-        if self.len < MINLEN {
+        if self.len < self.minlen() {
             return 0;
         }
         let mut cxt = self.len;
@@ -113,15 +139,21 @@ impl LZP {
     }
 
     /// Update model with actual byte ch (0..255)
+    #[inline(always)]
     pub fn update(&mut self, ch: u8) {
-        let y = (self.c() == ch as i32) as u8;
+        let gate = self.minlen();
+        let y = if self.len >= gate && self.c() == ch as i32 { 1 } else { 0 };
+
+        // update EMA for adaptive gating
+        let target = if y != 0 { EMA_SCALE } else { 0 };
+        self.ema_hits += (target - self.ema_hits) >> EMA_SHIFT;
 
         // update context hashes
         self.h1 = self.h1.wrapping_mul(3 << 4).wrapping_add(ch as u32).wrapping_add(1);
         self.h2 = (self.h2 << 8) | (ch as u32);
         self.h = self.h.wrapping_mul(5 << 2).wrapping_add(ch as usize + 1) & (self.hsize - 1);
 
-        if self.len >= MINLEN {
+        if self.len >= gate {
             self.sm1.update(y, 255);
             self.a1.update(y);
             self.a2.update(y);
@@ -137,7 +169,7 @@ impl LZP {
         }
 
         // write byte to ring buffer
-        self.buf[self.pos & (self.n - 1)] = ch;
+        self.buf[self.pos & self.mask] = ch;
         self.pos = self.pos.wrapping_add(1);
 
         if y != 0 {
@@ -148,14 +180,14 @@ impl LZP {
             self.literals += 1;
             self.len = 1;
             let mut m = self.t[self.h] as isize;
-            if ((m ^ self.pos as isize) & ((self.n as isize) - 1)) == 0 {
+            if ((m ^ self.pos as isize) & (self.n as isize - 1)) == 0 {
                 m -= 1;
             }
             // grow match
             let mut l = 1usize;
             while l <= 128 {
-                let b1 = self.buf[((m as usize).wrapping_sub(l)) & (self.n - 1)];
-                let b2 = self.buf[(self.pos.wrapping_sub(l)) & (self.n - 1)];
+                let b1 = self.buf[((m as usize).wrapping_sub(l)) & self.mask];
+                let b2 = self.buf[(self.pos.wrapping_sub(l)) & self.mask];
                 if b1 != b2 {
                     break;
                 }

@@ -14,16 +14,21 @@ impl MemLevel {
     }
 
     /// Returns total bytes of MEM = 1 << (22 + level)
+    #[inline(always)]
     pub fn bytes(self) -> usize {
         let shift = 22u32 + self.level as u32;
+        // Saturating behavior is not desirable; panic is better than silent wrap.
+        // On 32-bit targets, very high levels may fail at allocation time.
         1usize << shift
     }
 
     /// Returns the header byte to be stored in the archive ('1'..'9').
+    #[inline(always)]
     pub fn header_char(self) -> u8 {
         b'0' + self.level
     }
 
+    #[inline(always)]
     pub fn from_header_char(c: u8) -> anyhow::Result<Self> {
         anyhow::ensure!((b'1'..=b'9').contains(&c), "invalid mem header byte");
         let level = (c - b'0') as u8;
@@ -44,12 +49,15 @@ pub struct Progress {
 }
 
 impl Progress {
+    #[inline(always)]
     pub fn none() -> Self {
         Self { verbose: false }
     }
+    #[inline(always)]
     pub fn verbose() -> Self {
         Self { verbose: true }
     }
+    #[inline(always)]
     pub fn log(&self, s: impl AsRef<str>) {
         if self.verbose {
             eprintln!("{}", s.as_ref());

@@ -13,7 +13,8 @@ pub enum Mode {
     Decompress,
 }
 
-pub const BUFSIZE: usize = 0x20_000; // 128 KiB
+// Increased to 2 MiB to reduce block overhead and improve throughput.
+pub const BUFSIZE: usize = 0x200_000; // 2 MiB
 
 /// Encoder encapsulates range coder and block buffering.
 pub struct Encoder<'a, R: Read, W: Write> {
@@ -35,6 +36,7 @@ pub struct Encoder<'a, R: Read, W: Write> {
 }
 
 impl<'a, R: Read, W: Write> Encoder<'a, R, W> {
+    #[inline(always)]
     pub fn new_compress(progress: Progress) -> Self {
         Self {
             mode: Mode::Compress,
@@ -78,11 +80,13 @@ impl<'a, R: Read, W: Write> Encoder<'a, R, W> {
     }
 
     /// Accessor for pending compressed bytes in the current block buffer.
+    #[inline(always)]
     pub fn pending_bytes(&self) -> usize {
         self.csize_in_blk
     }
 
     /// Compress bit `y` or return decompressed bit.
+    #[inline(always)]
     pub fn code(&mut self, predictor: &mut Predictor, lzp: &mut LZP, y_in: u8) -> Result<u8> {
         let p = predictor.p(lzp); // 0..4095
         let p_adj = p + ((p < 2048) as i32);
@@ -112,12 +116,9 @@ impl<'a, R: Read, W: Write> Encoder<'a, R, W> {
                     self.csize_in_blk += 1;
                 }
                 Mode::Decompress => {
-                    let b = {
-                        let mut bb = [0u8; 1];
-                        self.r.as_mut().unwrap().read_exact(&mut bb)?;
-                        bb[0]
-                    };
-                    self.x = (self.x << 8) | b as u32;
+                    let mut bb = [0u8; 1];
+                    self.r.as_mut().unwrap().read_exact(&mut bb)?;
+                    self.x = (self.x << 8) | bb[0] as u32;
                 }
             }
             self.x1 <<= 8;

@@ -38,9 +38,7 @@ static STRETCH: OnceLock<Stretch> = OnceLock::new();
 static ILOG: OnceLock<Ilog> = OnceLock::new();
 
 fn build_squash() -> Squash {
-    // Initialize squash
     let mut s_tab = [0i32; 4096];
-    // table 't' from original code
     let t: [i32; 33] = [
         1, 2, 3, 6, 10, 16, 27, 45, 73, 120, 194, 310, 488, 747, 1101, 1546, 2047,
         2549, 2994, 3348, 3607, 3785, 3901, 3975, 4022, 4050, 4068, 4079, 4085,
@@ -56,7 +54,6 @@ fn build_squash() -> Squash {
 }
 
 fn build_stretch(squash: &Squash) -> Stretch {
-    // Initialize stretch by inverting squash
     let mut str_tab = [0i32; 4096];
     let mut pi = 0usize;
     for x in -2047..=2047 {
@@ -71,11 +68,9 @@ fn build_stretch(squash: &Squash) -> Stretch {
 }
 
 fn build_ilog() -> Ilog {
-    // Initialize Ilog via numerical integration (same constants as original)
     let mut ilog = [0u8; 65536];
     let mut x: u32 = 14_155_776;
     for i in 2..65536 {
-        // numerator is 2^29 / ln 2
         x = x.wrapping_add(774_541_002 / (i * 2 - 1) as u32);
         ilog[i] = (x >> 24) as u8;
     }
@@ -94,6 +89,7 @@ impl Squash {
             self.tab[d2 as usize]
         }
     }
+    #[inline(always)]
     pub fn global() -> &'static Squash {
         SQUASH.get_or_init(|| build_squash())
     }
@@ -105,6 +101,7 @@ impl Stretch {
         debug_assert!((0..4096).contains(&p));
         self.tab[p as usize]
     }
+    #[inline(always)]
     pub fn global() -> &'static Stretch {
         STRETCH.get_or_init(|| {
             let sq = Squash::global();
@@ -118,6 +115,7 @@ impl Ilog {
     pub fn apply(&self, x: u16) -> u8 {
         self.tab[x as usize]
     }
+    #[inline(always)]
     pub fn global() -> &'static Ilog {
         ILOG.get_or_init(|| build_ilog())
     }

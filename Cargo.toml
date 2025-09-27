@@ -1,19 +1,30 @@
 [package]
 name = "paq9a_rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Port of Matt Mahoney's paq9a by ChatGPT (Rust)"]
 description = "Safe, idiomatic Rust port of paq9a (2007) archiver"
+
+[features]
+# Optional: enable CPU prefetch in hashtable lookup on x86/x86_64
+prefetch = []
 
 [dependencies]
 anyhow = "1.0"
 thiserror = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 bytes = "1.6"
-memmap2 = "0.9" # used only in tests for mmap convenience (dev-dep), but keep here optional
 
 [dev-dependencies]
 tempfile = "3.10"
 assert_cmd = "2.0"
 predicates = "3.1"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+incremental = false
